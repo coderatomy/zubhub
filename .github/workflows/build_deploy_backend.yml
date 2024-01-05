@@ -13,76 +13,43 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
+  build_and_push:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: ['web', 'celery', 'media']
     steps:
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v1
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v1
-      - name: Login to DockerHub
-        uses: docker/login-action@v1
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: unstructuredstudio/zubhub/.github/actions/checkout@master
 
-      - name: Checkout files
-        uses: actions/checkout@v2
-
-      - name: Build and push django api
-        id: docker_build_web
-        uses: docker/build-push-action@v2
+      - name: Build and push ${{ matrix.service }}
+        uses: unstructuredstudio/zubhub/.github/actions/docker_build_and_push@master
         with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          token: ${{ secrets.DOCKERHUB_TOKEN }}
           context: ./zubhub_backend/
-          file: ./zubhub_backend/compose/web/prod/Dockerfile
+          file: ./zubhub_backend/compose/${{ matrix.service }}/prod/Dockerfile
           push: true
-          tags: unstructuredstudio/zubhub-services_web:latest
-      - name: Image digest
-        run: echo ${{ steps.docker_build.outputs.digest }}
-
-      - name: Build and push celery worker
-        id: docker_build_celery
-        uses: docker/build-push-action@v2
-        with:
-          context: ./zubhub_backend/
-          file: ./zubhub_backend/compose/celery/Dockerfile
-          push: true
-          tags: unstructuredstudio/zubhub-services_celery:latest
-      - name: Image digest
-        run: echo ${{ steps.docker_build.outputs.digest }}
-
-      - name: Build and push media service
-        id: docker_build_media
-        uses: docker/build-push-action@v2
-        with:
-          context: ./zubhub_backend/
-          file: ./zubhub_backend/compose/media/prod/Dockerfile
-          push: true
-          tags: unstructuredstudio/zubhub-services_media:latest
-      - name: Image digest
-        run: echo ${{ steps.docker_build.outputs.digest }}
+          tags: unstructuredstudio/zubhub-services_${{ matrix.service }}:latest
 
   deploy:
-    needs: build
+    needs: build_and_push
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v1
+      - uses: unstructuredstudio/zubhub/.github/actions/checkout@master
 
-      - name: Copy file via scp
-        uses: appleboy/scp-action@master
+      - uses: unstructuredstudio/zubhub/.github/actions/scp_action@master
         with:
-          host: ${{ secrets.DO_BACKEND_HOST }}
-          username: ${{ secrets.DO_BACKEND_USERNAME }}
+          host: ${{ vars.DO_BACKEND_HOST }}
+          username: ${{ vars.DO_BACKEND_USERNAME }}
           key: ${{ secrets.DO_SSHKEY }}
           source: "."
           target: "/home/zubhub-services/zubhub"
 
-      - name: Executing remote  command
-        uses: appleboy/ssh-action@master
+      - uses: unstructuredstudio/zubhub/.github/actions/ssh_action@master
         with:
-          host: ${{ secrets.DO_BACKEND_HOST }}
-          username: ${{ secrets.DO_BACKEND_USERNAME }}
+          host: ${{ vars.DO_BACKEND_HOST }}
+          username: ${{ vars.DO_BACKEND_USERNAME }}
           key: ${{ secrets.DO_SSHKEY }}
           script: |
             cp /home/zubhub-services/zubhub/zubhub_backend/compose/deploy_backend.sh /home/zubhub-services/
@@ -91,3 +58,49 @@ jobs:
             droplets_count=`wc -l < droplets.txt`
             rm droplets.txt
             docker service scale zubhub-services_web=$(($droplets_count - 1))
+
+      - name: Get zubhub-services droplet IPs
+        id: get_droplet_ips
+        uses: unstructuredstudio/zubhub/.github/actions/doctl_action@master
+        with:
+          token: ${{ secrets.DO_ACCESS_TOKEN }}
+          script: |
+
+            # This script will be executed inside a composite action.
+            # rename GITHUB_OUTPUT so that it's clear that it's a 
+            # composite output and should be handled differently from $GITHUB_OUTPUT
+            COMPOSITE_OUTPUT=$GITHUB_OUTPUT
+            doctl compute droplet list 'zubhub-services*' \
+            --format PublicIPv4 --no-header > droplets.txt
+
+            # convert to stringified array to be used in the prune job
+            echo "DROPLET_IPS=$( cat droplets.txt  | jq -Rsc '. / "\n" - [""]')" >> $COMPOSITE_OUTPUT
+
+    outputs:
+      DROPLET_IPS: ${{ fromJson(steps.get_droplet_ips.outputs.JSON_STRING).DROPLET_IPS }}
+
+  prune:
+    needs: deploy
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        host: ${{ fromJson(needs.deploy.outputs.DROPLET_IPS) }}
+    steps:
+      - name: Execute docker system prune on ${{ matrix.host }}
+        uses: unstructuredstudio/zubhub/.github/actions/ssh_action@master
+        with:
+          host: ${{ matrix.host }}
+          username: ${{ vars.DO_BACKEND_USERNAME }}
+          key: ${{ secrets.DO_SSHKEY }}
+          script: |
+
+            docker system prune -a -f
+
+            volumes=$(docker volume ls -q)
+            # Loop through the volumes
+            while IFS= read -r volume; do
+              # Delete the volume if it doesn't end with "_data"
+              if [[ ! $volume =~ _data$ ]]; then
+                docker volume rm "$volume" 2> /dev/null || true
+              fi
+            done <<< "$volumes"
